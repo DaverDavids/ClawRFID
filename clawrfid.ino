@@ -25,21 +25,22 @@
 #include "html.h"
 
 // ── Configuration ──────────────────────────────────────────────────────────
-#define HOSTNAME  "clawrfid"
-#define AP_SSID    HOSTNAME
-#define WIFI_TIMEOUT  5000    // ms per attempt
+#define HOSTNAME      "clawrfid"
+#define AP_SSID        HOSTNAME
+#define WIFI_TIMEOUT   5000    // ms per attempt
+
+// SPI clock — RC522 supports up to 10 MHz; be explicit so we never get a
+// slower platform default.
+#define RFID_SPI_HZ    10000000UL
 
 // ── Pins ───────────────────────────────────────────────────────────────────
-// Shared SPI bus
 #define RFID_SCK   8
 #define RFID_MISO  9
 #define RFID_MOSI  10
 
-// Reader 1
 #define RFID1_SS   7
 #define RFID1_RST  1
 
-// Reader 2  —  adjust to match your wiring
 #define RFID2_SS   2
 #define RFID2_RST  3
 
@@ -50,14 +51,14 @@ Preferences prefs;
 MFRC522     rfid1(RFID1_SS, RFID1_RST);
 MFRC522     rfid2(RFID2_SS, RFID2_RST);
 
-bool   apMode  = false;
+bool   apMode   = false;
 String lastUID1 = "None";
 String lastUID2 = "None";
 
 // ── JSON helper ────────────────────────────────────────────────────────────
 void sendJSON(int code, const String &json) {
-  server.sendHeader("Connection",                "keep-alive");
-  server.sendHeader("Cache-Control",             "no-store");
+  server.sendHeader("Connection",                  "keep-alive");
+  server.sendHeader("Cache-Control",               "no-store");
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(code, "application/json", json);
 }
@@ -76,7 +77,6 @@ bool connectWifi(const String &ssid, const String &psk) {
   WiFi.disconnect(true);
   delay(200);
 
-  // Retry loop — 3 attempts, WIFI_TIMEOUT ms each
   for (int attempt = 0; attempt < 3; attempt++) {
     DPRINT("Connecting to "); DPRINT(ssid);
     DPRINT(" attempt "); DPRINTLN(attempt + 1);
@@ -146,8 +146,7 @@ void handleSaveWifi() {
 
 void handleNotFound() {
   if (apMode) {
-    server.sendHeader("Location",
-      "http://" + WiFi.softAPIP().toString() + "/");
+    server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
     server.send(302);
   } else {
     server.send(404, "text/plain", "not found");
@@ -163,13 +162,52 @@ void setupServer() {
   DPRINTLN("HTTP server started");
 }
 
-// ── RFID helper ────────────────────────────────────────────────────────────
-String pollReader(MFRC522 &rfid, const char *label) {
-  byte buf[2];
-  byte bsz = sizeof(buf);
-  if (rfid.PICC_WakeupA(buf, &bsz) != MFRC522::STATUS_OK) return "";
-  if (!rfid.PICC_ReadCardSerial())                          return "";
+// ── RFID helpers ───────────────────────────────────────────────────────────
+//
+// Strategy for maximum poll rate / zero missed tags:
+//
+//  1. Use REQA (RequestA) instead of WakeupA so we detect cards that are
+//     already in IDLE state (fresh cards entering the field). WakeupA is
+//     needed to wake HALT-ed cards but we always HALT after a successful
+//     read, so on the very next poll we must use WakeupA. We alternate:
+//     RequestA first; if that fails, try WakeupA. This covers both cases.
+//
+//  2. After every successful read — and after every failed attempt — we
+//     explicitly HALT the PICC and stop crypto. Without this the RC522
+//     stays in ACTIVE state talking to the last card, blocking detection
+//     of any new card on subsequent polls.
+//
+//  3. SPI clock is set to 10 MHz (RFID_SPI_HZ) so frame transfers are as
+//     short as possible.
+//
+//  4. No delay() anywhere in the poll path.
+//
+// Returns the colon-separated uppercase UID string, or "" if no card found.
 
+static inline void rfidIdle(MFRC522 &rfid) {
+  rfid.PICC_HaltA();      // send HALT command — PICC enters HALT state
+  rfid.PCD_StopCrypto1(); // clear MFCrypto1On bit — ready for next poll
+}
+
+String pollReader(MFRC522 &rfid, const char *label) {
+  byte atqaBuf[2];
+  byte atqaLen = sizeof(atqaBuf);
+
+  // Try REQA first (detects cards in IDLE), then WUPA (detects HALT-ed cards).
+  // The second path is the common case after our own rfidIdle() call, but
+  // both checks together ensure we never miss a card regardless of its state.
+  bool detected =
+    (rfid.PICC_RequestA(atqaBuf, &atqaLen) == MFRC522::STATUS_OK) ||
+    (rfid.PICC_WakeupA (atqaBuf, &atqaLen) == MFRC522::STATUS_OK);
+
+  if (!detected) return "";
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    rfidIdle(rfid); // clean up even on partial failure
+    return "";
+  }
+
+  // Build UID string
   String uid = "";
   for (byte i = 0; i < rfid.uid.size; i++) {
     if (i) uid += ':';
@@ -177,7 +215,11 @@ String pollReader(MFRC522 &rfid, const char *label) {
     uid += String(rfid.uid.uidByte[i], HEX);
   }
   uid.toUpperCase();
-  rfid.PCD_StopCrypto1();
+
+  // Always idle immediately — lets the reader scan for the next card on the
+  // very next loop iteration instead of staying stuck in ACTIVE state.
+  rfidIdle(rfid);
+
   DPRINT(label); DPRINT(" UID: "); DPRINTLN(uid);
   return uid;
 }
@@ -210,22 +252,27 @@ void setup() {
 
   setupServer();
 
+  // Explicit 10 MHz SPI clock — do not rely on platform default
   SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID1_SS);
+  SPI.setFrequency(RFID_SPI_HZ);
+
   rfid1.PCD_Init();
   rfid1.PCD_SetAntennaGain(rfid1.RxGain_max);
+  rfidIdle(rfid1); // start in a clean known state
   DPRINTLN("RFID1 ready");
 
   rfid2.PCD_Init();
   rfid2.PCD_SetAntennaGain(rfid2.RxGain_max);
+  rfidIdle(rfid2);
   DPRINTLN("RFID2 ready");
 }
 
 // ── Loop ───────────────────────────────────────────────────────────────────
 void loop() {
+  // ── Network services (non-blocking) ──────────────────────────────────────
   if (!apMode) {
     ArduinoOTA.handle();
 
-    // WiFi reconnect — debounced to every 5 s
     static uint32_t lastWifiCheck = 0;
     if (millis() - lastWifiCheck > 5000) {
       lastWifiCheck = millis();
@@ -248,7 +295,7 @@ void loop() {
 
   server.handleClient();
 
-  // ── Reader 1
+  // ── Reader 1 ──────────────────────────────────────────────────────────────
   {
     String uid = pollReader(rfid1, "[RFID1]");
     if (uid.length() && uid != lastUID1) {
@@ -257,7 +304,7 @@ void loop() {
     }
   }
 
-  // ── Reader 2
+  // ── Reader 2 ──────────────────────────────────────────────────────────────
   {
     String uid = pollReader(rfid2, "[RFID2]");
     if (uid.length() && uid != lastUID2) {
