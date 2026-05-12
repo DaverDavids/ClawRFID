@@ -30,8 +30,8 @@
 // Reader 2
 // Pick two free GPIO for SS and RST on your board.
 // Adjust these defines to match your wiring.
-#define RFID2_SS   5
-#define RFID2_RST  4
+#define RFID2_SS   2
+#define RFID2_RST  3
 
 // ── MFRC522 instances ────────────────────────────────────────────────────────
 MFRC522 rfid1(RFID1_SS, RFID1_RST);
