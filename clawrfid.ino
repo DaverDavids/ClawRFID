@@ -39,8 +39,8 @@
 #define RFID1_RST  1
 
 // Reader 2  —  adjust to match your wiring
-#define RFID2_SS   5
-#define RFID2_RST  4
+#define RFID2_SS   2
+#define RFID2_RST  3
 
 // ── Globals ───────────────────────────────────────────────────────────────────
 Preferences prefs;
@@ -152,8 +152,8 @@ void setup() {
   DBGLN("\n== " HOSTNAME " ==");
 
   prefs.begin("wifi", true);
-  String ssid = prefs.getString("ssid", MYSSID);
-  String psk  = prefs.getString("psk",  MYPSK);
+  String ssid = prefs.getString("ssid", MYSSIDIOT);
+  String psk  = prefs.getString("psk",  MYPSKIOT);
   prefs.end();
 
   if (connectWiFi(ssid, psk)) startNetServices();
