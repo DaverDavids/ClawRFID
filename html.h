@@ -2,7 +2,8 @@
 
 // =============================================================================
 //  html.h  —  clawrfid Web UI
-//  Shows the last-seen UID from each of the two RC522 readers.
+//  INDEX_HTML  : main page — shows last UID from each RC522 reader
+//  PORTAL_HTML : captive portal WiFi setup page (AP mode)
 //  Auto-refreshes via /data JSON every 750 ms.
 // =============================================================================
 
@@ -21,7 +22,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   table{width:100%;border-collapse:collapse}
   td{padding:5px 2px;font-size:.9em}
   td:last-child{text-align:right;font-family:monospace;font-weight:700;font-size:1.05em;letter-spacing:2px}
-  .lbl{color:#777;font-size:.75em;margin-bottom:6px}
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#333;margin-right:5px;vertical-align:middle}
   .dot.ok{background:#4caf50}
   footer{text-align:right;font-size:.7em;color:#333;margin-top:6px}
@@ -31,19 +31,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
 <div class="card">
   <h2>Reader 1 (RFID1)</h2>
-  <table>
-    <tr><td>Last UID</td><td id="uid1">—</td></tr>
-  </table>
+  <table><tr><td>Last UID</td><td id="uid1">&mdash;</td></tr></table>
 </div>
 
 <div class="card">
   <h2>Reader 2 (RFID2)</h2>
-  <table>
-    <tr><td>Last UID</td><td id="uid2">—</td></tr>
-  </table>
+  <table><tr><td>Last UID</td><td id="uid2">&mdash;</td></tr></table>
 </div>
 
-<footer><span class="dot" id="dot"></span><span id="ts">—</span></footer>
+<footer><span class="dot" id="dot"></span><span id="ts">&mdash;</span></footer>
 
 <script>
 function update(){
@@ -60,25 +56,26 @@ setInterval(update, 750);
 </body></html>
 )rawliteral";
 
-const char WIFI_HTML[] PROGMEM = R"rawliteral(
+const char PORTAL_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WiFi Setup</title>
+<title>ClawRFID — WiFi Setup</title>
 <style>
   body{font-family:sans-serif;background:#111;color:#ddd;max-width:400px;margin:40px auto;padding:0 16px}
   h2{color:#aaa}
   input{width:100%;padding:9px;margin:5px 0 14px;background:#222;border:1px solid #444;color:#eee;border-radius:5px;font-size:1em}
   button{width:100%;padding:11px;background:#1976d2;color:#fff;border:none;border-radius:5px;font-size:1em;cursor:pointer}
+  button:hover{background:#1565c0}
   .note{font-size:.8em;color:#555;margin-top:18px}
 </style>
 </head><body>
 <h2>&#x1F4F6; WiFi Setup</h2>
-<form method="POST" action="/setwifi">
+<form method="POST" action="/savewifi">
   <label>SSID</label><input type="text" name="ssid" autocomplete="off" required>
   <label>Password</label><input type="password" name="psk">
   <button type="submit">Save &amp; Connect</button>
 </form>
-<p class="note">Saved to flash. Device reboots and connects.</p>
+<p class="note">Credentials saved to flash. Device reboots and connects.</p>
 </body></html>
 )rawliteral";

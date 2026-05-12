@@ -3,6 +3,16 @@
 //  Libs: MFRC522, ArduinoOTA, ESPmDNS, Preferences
 // =============================================================================
 
+#define DEBUG 1
+#if DEBUG
+  #define DPRINT(x)   Serial.print(x)
+  #define DPRINTLN(x) Serial.println(x)
+#else
+  #define DPRINT(x)
+  #define DPRINTLN(x)
+#endif
+
+#include <Arduino.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
@@ -14,21 +24,12 @@
 #include <Secrets.h>
 #include "html.h"
 
-// ── Debug ────────────────────────────────────────────────────────────────────
-#define DEBUG 1
-#if DEBUG
-  #define DBG(x)   Serial.print(x)
-  #define DBGLN(x) Serial.println(x)
-#else
-  #define DBG(x)
-  #define DBGLN(x)
-#endif
+// ── Configuration ──────────────────────────────────────────────────────────
+#define HOSTNAME  "clawrfid"
+#define AP_SSID    HOSTNAME
+#define WIFI_TIMEOUT  5000    // ms per attempt
 
-#define HOSTNAME        "clawrfid"
-#define WIFI_TIMEOUT_MS  12000UL
-#define RECONNECT_MS      5000UL
-
-// ── Pins ─────────────────────────────────────────────────────────────────────
+// ── Pins ───────────────────────────────────────────────────────────────────
 // Shared SPI bus
 #define RFID_SCK   8
 #define RFID_MISO  9
@@ -42,10 +43,10 @@
 #define RFID2_SS   2
 #define RFID2_RST  3
 
-// ── Globals ───────────────────────────────────────────────────────────────────
-Preferences prefs;
+// ── Globals ────────────────────────────────────────────────────────────────
 WebServer   server(80);
 DNSServer   dns;
+Preferences prefs;
 MFRC522     rfid1(RFID1_SS, RFID1_RST);
 MFRC522     rfid2(RFID2_SS, RFID2_RST);
 
@@ -53,78 +54,116 @@ bool   apMode  = false;
 String lastUID1 = "None";
 String lastUID2 = "None";
 
-// ── WiFi ───────────────────────────────────────────────────────────────────
-bool connectWiFi(const String &ssid, const String &psk) {
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(HOSTNAME);
-  WiFi.setTxPower(WIFI_POWER_15dBm);
-  WiFi.begin(ssid.c_str(), psk.c_str());
-  DBG("Connecting to "); DBGLN(ssid);
-  unsigned long t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < WIFI_TIMEOUT_MS) {
-    delay(250); DBG('.');
-  }
-  DBGLN();
-  if (WiFi.status() == WL_CONNECTED) { DBG("IP: "); DBGLN(WiFi.localIP()); return true; }
-  DBGLN("WiFi failed"); return false;
+// ── JSON helper ────────────────────────────────────────────────────────────
+void sendJSON(int code, const String &json) {
+  server.sendHeader("Connection",                "keep-alive");
+  server.sendHeader("Cache-Control",             "no-store");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(code, "application/json", json);
 }
 
-void startCaptivePortal() {
+// ── WiFi ───────────────────────────────────────────────────────────────────
+bool connectWifi(const String &ssid, const String &psk) {
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  WiFi.setHostname(HOSTNAME);
+
+  // RF calibration kick
+  WiFi.begin(ssid.c_str(), psk.c_str());
+  delay(500);
+  WiFi.disconnect(true);
+  delay(200);
+
+  // Retry loop — 3 attempts, WIFI_TIMEOUT ms each
+  for (int attempt = 0; attempt < 3; attempt++) {
+    DPRINT("Connecting to "); DPRINT(ssid);
+    DPRINT(" attempt "); DPRINTLN(attempt + 1);
+    WiFi.begin(ssid.c_str(), psk.c_str());
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT) {
+      delay(100); DPRINT(".");
+    }
+    DPRINTLN("");
+    if (WiFi.status() == WL_CONNECTED) return true;
+    WiFi.disconnect(true);
+    delay(500);
+  }
+  DPRINTLN("WiFi failed");
+  return false;
+}
+
+void startAP() {
   apMode = true;
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(HOSTNAME);
+  WiFi.setTxPower(WIFI_POWER_15dBm);
+  WiFi.softAP(AP_SSID);
   dns.start(53, "*", WiFi.softAPIP());
-  DBG("AP IP: "); DBGLN(WiFi.softAPIP());
+  DPRINT("AP started: "); DPRINTLN(AP_SSID);
+  DPRINT("AP IP: ");      DPRINTLN(WiFi.softAPIP());
 }
 
-void startNetServices() {
-  MDNS.end();
-  MDNS.begin(HOSTNAME);
+// ── OTA ────────────────────────────────────────────────────────────────────
+void setupOTA() {
   ArduinoOTA.setHostname(HOSTNAME);
-  ArduinoOTA.onStart([]()  { DBGLN("OTA start"); });
-  ArduinoOTA.onError([](ota_error_t e) { DBG("OTA err "); DBGLN(e); });
+  ArduinoOTA.onStart([]()  { DPRINTLN("OTA start"); });
+  ArduinoOTA.onEnd([]()    { DPRINTLN("OTA done");  });
+  ArduinoOTA.onError([](ota_error_t e) { DPRINT("OTA error: "); DPRINTLN(e); });
   ArduinoOTA.begin();
-  DBGLN("mDNS+OTA ready \u2192 " HOSTNAME ".local");
 }
 
-// ── Web routes ────────────────────────────────────────────────────────────────
+// ── Web routes ─────────────────────────────────────────────────────────────
 void handleRoot() {
-  server.send_P(200, "text/html", apMode ? WIFI_HTML : INDEX_HTML);
+  server.send_P(200, "text/html", apMode ? PORTAL_HTML : INDEX_HTML);
 }
 
 void handleData() {
-  String j =
+  sendJSON(200,
     "{\"uid1\":\"" + lastUID1 + "\"" +
     ",\"uid2\":\"" + lastUID2 + "\"}"
-  ;
-  server.send(200, "application/json", j);
+  );
 }
 
-void handleSetWifi() {
-  if (!server.hasArg("ssid")) { server.send(400, "text/plain", "Missing ssid"); return; }
+void handleSaveWifi() {
+  if (!server.hasArg("ssid")) {
+    server.sendHeader("Location", "/");
+    server.send(302);
+    return;
+  }
   prefs.begin("wifi", false);
   prefs.putString("ssid", server.arg("ssid"));
   prefs.putString("psk",  server.arg("psk"));
   prefs.end();
-  server.send(200, "text/html", "<meta http-equiv='refresh' content='3;url=/'><p>Rebooting\u2026</p>");
+  server.send(200, "text/html",
+    "<html><body style='font-family:sans-serif;background:#111;color:#ddd;"
+    "text-align:center;padding:2rem'>"
+    "<h2 style='color:#4caf50'>Saved!</h2><p>Rebooting to connect...</p>"
+    "</body></html>");
   delay(1500);
   ESP.restart();
 }
 
-void setupServer() {
-  server.on("/",        HTTP_GET,  handleRoot);
-  server.on("/data",    HTTP_GET,  handleData);
-  server.on("/setwifi", HTTP_POST, handleSetWifi);
-  server.onNotFound([]() {
+void handleNotFound() {
+  if (apMode) {
     server.sendHeader("Location",
-      String("http://") +
-      (apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "/");
+      "http://" + WiFi.softAPIP().toString() + "/");
     server.send(302);
-  });
-  server.begin();
+  } else {
+    server.send(404, "text/plain", "not found");
+  }
 }
 
-// ── RFID helper ────────────────────────────────────────────────────────────────
+void setupServer() {
+  server.on("/",         HTTP_GET,  handleRoot);
+  server.on("/data",     HTTP_GET,  handleData);
+  server.on("/savewifi", HTTP_POST, handleSaveWifi);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  DPRINTLN("HTTP server started");
+}
+
+// ── RFID helper ────────────────────────────────────────────────────────────
 String pollReader(MFRC522 &rfid, const char *label) {
   byte buf[2];
   byte bsz = sizeof(buf);
@@ -139,54 +178,74 @@ String pollReader(MFRC522 &rfid, const char *label) {
   }
   uid.toUpperCase();
   rfid.PCD_StopCrypto1();
-  DBG(label); DBG(" UID: "); DBGLN(uid);
+  DPRINT(label); DPRINT(" UID: "); DPRINTLN(uid);
   return uid;
 }
 
-// ── Setup ────────────────────────────────────────────────────────────────────
+// ── Setup ──────────────────────────────────────────────────────────────────
 void setup() {
 #if DEBUG
   Serial.begin(115200);
-  delay(400);
+  delay(200);
 #endif
-  DBGLN("\n== " HOSTNAME " ==");
+  DPRINTLN("\n\n=== " HOSTNAME " ===");
 
   prefs.begin("wifi", true);
-  String ssid = prefs.getString("ssid", MYSSIDIOT);
-  String psk  = prefs.getString("psk",  MYPSKIOT);
+  String ssid = prefs.getString("ssid", MYSSID);
+  String psk  = prefs.getString("psk",  MYPSK);
   prefs.end();
 
-  if (connectWiFi(ssid, psk)) startNetServices();
-  else                         startCaptivePortal();
+  if (!connectWifi(ssid, psk)) {
+    DPRINTLN("WiFi failed — starting captive portal AP");
+    startAP();
+  } else {
+    DPRINT("Connected! IP: "); DPRINTLN(WiFi.localIP());
+    apMode = false;
+    if (MDNS.begin(HOSTNAME)) {
+      MDNS.addService("http", "tcp", 80);
+      DPRINTLN("mDNS: http://" HOSTNAME ".local");
+    }
+    setupOTA();
+  }
 
   setupServer();
 
   SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID1_SS);
-
   rfid1.PCD_Init();
   rfid1.PCD_SetAntennaGain(rfid1.RxGain_max);
-  DBGLN("RFID1 ready");
+  DPRINTLN("RFID1 ready");
 
   rfid2.PCD_Init();
   rfid2.PCD_SetAntennaGain(rfid2.RxGain_max);
-  DBGLN("RFID2 ready");
+  DPRINTLN("RFID2 ready");
 }
 
-// ── Loop ─────────────────────────────────────────────────────────────────────
+// ── Loop ───────────────────────────────────────────────────────────────────
 void loop() {
-  static unsigned long lastReconnect = 0;
-  if (!apMode && WiFi.status() != WL_CONNECTED && millis() - lastReconnect > RECONNECT_MS) {
-    lastReconnect = millis();
-    DBGLN("WiFi lost \u2014 reconnecting\u2026");
-    prefs.begin("wifi", true);
-    String ssid = prefs.getString("ssid", MYSSID);
-    String psk  = prefs.getString("psk",  MYPSK);
-    prefs.end();
-    if (connectWiFi(ssid, psk)) startNetServices();
+  if (!apMode) {
+    ArduinoOTA.handle();
+
+    // WiFi reconnect — debounced to every 5 s
+    static uint32_t lastWifiCheck = 0;
+    if (millis() - lastWifiCheck > 5000) {
+      lastWifiCheck = millis();
+      if (WiFi.status() != WL_CONNECTED) {
+        DPRINTLN("WiFi lost, reconnecting...");
+        prefs.begin("wifi", true);
+        String ssid = prefs.getString("ssid", MYSSID);
+        String psk  = prefs.getString("psk",  MYPSK);
+        prefs.end();
+        if (!connectWifi(ssid, psk)) {
+          DPRINTLN("Reconnect failed — fallback to AP");
+          startAP();
+          server.begin();
+        }
+      }
+    }
+  } else {
+    dns.processNextRequest();
   }
 
-  if (apMode) dns.processNextRequest();
-  else        ArduinoOTA.handle();
   server.handleClient();
 
   // ── Reader 1
