@@ -44,6 +44,21 @@
 #define RFID2_SS   2
 #define RFID2_RST  3
 
+// ── Error-rate tracking (rolling 16-poll window, bitmask, zero division) ───
+// Each bit = 1 success, 0 miss. Shift left every poll, OR in result.
+// No arrays, no division in the poll path — just two register ops.
+static uint16_t errMask1 = 0;
+static uint16_t errMask2 = 0;
+
+// Popcount for uint16 — compiler will inline/optimize to single instruction
+// on most targets; we only call this from handleData() (HTTP path), never
+// from the tight poll loop.
+static inline uint8_t popcount16(uint16_t v) {
+  v = v - ((v >> 1) & 0x5555u);
+  v = (v & 0x3333u) + ((v >> 2) & 0x3333u);
+  return (uint8_t)(((v + (v >> 4)) & 0x0F0Fu) * 0x0101u >> 8);
+}
+
 // ── Globals ────────────────────────────────────────────────────────────────
 WebServer   server(80);
 DNSServer   dns;
@@ -51,9 +66,11 @@ Preferences prefs;
 MFRC522     rfid1(RFID1_SS, RFID1_RST);
 MFRC522     rfid2(RFID2_SS, RFID2_RST);
 
-bool   apMode   = false;
-String lastUID1 = "None";
-String lastUID2 = "None";
+bool     apMode      = false;
+String   lastUID1    = "None";
+String   lastUID2    = "None";
+uint32_t lastRead1   = 0;   // millis() of last successful read, 0 = never
+uint32_t lastRead2   = 0;
 
 // ── JSON helper ────────────────────────────────────────────────────────────
 void sendJSON(int code, const String &json) {
@@ -119,10 +136,31 @@ void handleRoot() {
 }
 
 void handleData() {
-  sendJSON(200,
-    "{\"uid1\":\"" + lastUID1 + "\"" +
-    ",\"uid2\":\"" + lastUID2 + "\"}"
+  // Antenna gain register value: 0x00–0x70 (3 bits × 16 = 7 steps).
+  // Read once here (HTTP path), never in the poll loop.
+  uint8_t gain1 = (rfid1.PCD_ReadRegister(MFRC522::RFCfgReg) >> 4) & 0x07;
+  uint8_t gain2 = (rfid2.PCD_ReadRegister(MFRC522::RFCfgReg) >> 4) & 0x07;
+
+  // Hits out of 16 polls → 0-16
+  uint8_t hits1 = popcount16(errMask1);
+  uint8_t hits2 = popcount16(errMask2);
+
+  // ms since last read (0 if never seen)
+  uint32_t age1 = lastRead1 ? (millis() - lastRead1) : 0xFFFFFFFFu;
+  uint32_t age2 = lastRead2 ? (millis() - lastRead2) : 0xFFFFFFFFu;
+
+  char buf[200];
+  snprintf(buf, sizeof(buf),
+    "{\"uid1\":\"%s\",\"uid2\":\"%s\""
+    ",\"gain1\":%u,\"gain2\":%u"
+    ",\"hits1\":%u,\"hits2\":%u"
+    ",\"age1\":%lu,\"age2\":%lu}",
+    lastUID1.c_str(), lastUID2.c_str(),
+    gain1, gain2,
+    hits1, hits2,
+    (unsigned long)age1, (unsigned long)age2
   );
+  sendJSON(200, buf);
 }
 
 void handleSaveWifi() {
@@ -183,27 +221,31 @@ void setupServer() {
 //  4. No delay() anywhere in the poll path.
 //
 // Returns the colon-separated uppercase UID string, or "" if no card found.
+// errMask is shifted and updated here — single OR, no branches added.
 
 static inline void rfidIdle(MFRC522 &rfid) {
   rfid.PICC_HaltA();      // send HALT command — PICC enters HALT state
   rfid.PCD_StopCrypto1(); // clear MFCrypto1On bit — ready for next poll
 }
 
-String pollReader(MFRC522 &rfid, const char *label) {
+String pollReader(MFRC522 &rfid, const char *label,
+                  uint16_t &errMask, uint32_t &lastReadTs) {
   byte atqaBuf[2];
   byte atqaLen = sizeof(atqaBuf);
 
   // Try REQA first (detects cards in IDLE), then WUPA (detects HALT-ed cards).
-  // The second path is the common case after our own rfidIdle() call, but
-  // both checks together ensure we never miss a card regardless of its state.
   bool detected =
     (rfid.PICC_RequestA(atqaBuf, &atqaLen) == MFRC522::STATUS_OK) ||
     (rfid.PICC_WakeupA (atqaBuf, &atqaLen) == MFRC522::STATUS_OK);
 
+  // Rolling 16-poll window: shift left, set LSB on hit.
+  // Two ops, no branch added to the hot path.
+  errMask = (errMask << 1) | (detected ? 1u : 0u);
+
   if (!detected) return "";
 
   if (!rfid.PICC_ReadCardSerial()) {
-    rfidIdle(rfid); // clean up even on partial failure
+    rfidIdle(rfid);
     return "";
   }
 
@@ -216,8 +258,8 @@ String pollReader(MFRC522 &rfid, const char *label) {
   }
   uid.toUpperCase();
 
-  // Always idle immediately — lets the reader scan for the next card on the
-  // very next loop iteration instead of staying stuck in ACTIVE state.
+  lastReadTs = millis(); // timestamp of successful read
+
   rfidIdle(rfid);
 
   DPRINT(label); DPRINT(" UID: "); DPRINTLN(uid);
@@ -258,7 +300,7 @@ void setup() {
 
   rfid1.PCD_Init();
   rfid1.PCD_SetAntennaGain(rfid1.RxGain_max);
-  rfidIdle(rfid1); // start in a clean known state
+  rfidIdle(rfid1);
   DPRINTLN("RFID1 ready");
 
   rfid2.PCD_Init();
@@ -297,7 +339,7 @@ void loop() {
 
   // ── Reader 1 ──────────────────────────────────────────────────────────────
   {
-    String uid = pollReader(rfid1, "[RFID1]");
+    String uid = pollReader(rfid1, "[RFID1]", errMask1, lastRead1);
     if (uid.length() && uid != lastUID1) {
       lastUID1 = uid;
       // TODO: application logic
@@ -306,7 +348,7 @@ void loop() {
 
   // ── Reader 2 ──────────────────────────────────────────────────────────────
   {
-    String uid = pollReader(rfid2, "[RFID2]");
+    String uid = pollReader(rfid2, "[RFID2]", errMask2, lastRead2);
     if (uid.length() && uid != lastUID2) {
       lastUID2 = uid;
       // TODO: application logic
