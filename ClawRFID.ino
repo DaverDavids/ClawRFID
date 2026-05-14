@@ -1,6 +1,12 @@
 // =============================================================================
 //  clawrfid.ino  —  ESP32-C3 | Dual MFRC522 (SPI) | WiFi UI
-//  Libs: MFRC522, ArduinoOTA, ESPmDNS, Preferences
+//  Libs: MFRC522v2 (OSSLibraries), ArduinoOTA, ESPmDNS, Preferences
+//
+//  Library note: uses MFRC522v2 by OSSLibraries (not the legacy miguelbalboa
+//  fork). The legacy fork uses PrintCanvas which was removed in ESP32 Arduino
+//  Core 3.x. MFRC522v2 is a drop-in replacement with an identical public API.
+//  Arduino IDE : search "MFRC522v2" in Library Manager, install by OSSLibraries.
+//  PlatformIO  : lib_deps = OSSLibraries/Arduino_MFRC522v2
 // =============================================================================
 
 #define DEBUG 1
@@ -20,7 +26,9 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <SPI.h>
-#include <MFRC522.h>
+#include <MFRC522v2.h>        // OSSLibraries — works with ESP32 Core 3.x
+#include <MFRC522DriverSPI.h>
+#include <MFRC522DriverPinSimple.h>
 #include <Secrets.h>
 #include "html.h"
 
@@ -29,8 +37,7 @@
 #define AP_SSID        HOSTNAME
 #define WIFI_TIMEOUT   5000    // ms per attempt
 
-// SPI clock — RC522 supports up to 10 MHz; be explicit so we never get a
-// slower platform default.
+// SPI clock — RC522 supports up to 10 MHz.
 #define RFID_SPI_HZ    10000000UL
 
 // ── Pins ───────────────────────────────────────────────────────────────────
@@ -44,15 +51,19 @@
 #define RFID2_SS   2
 #define RFID2_RST  3
 
-// ── Error-rate tracking (rolling 16-poll window, bitmask, zero division) ───
-// Each bit = 1 success, 0 miss. Shift left every poll, OR in result.
-// No arrays, no division in the poll path — just two register ops.
+// ── MFRC522v2 driver objects ────────────────────────────────────────────────
+// MFRC522v2 separates the pin/SPI driver from the protocol object.
+MFRC522DriverPinSimple ss1Pin(RFID1_SS);
+MFRC522DriverPinSimple ss2Pin(RFID2_SS);
+MFRC522DriverSPI       driver1{ss1Pin};
+MFRC522DriverSPI       driver2{ss2Pin};
+MFRC522                rfid1{driver1};
+MFRC522                rfid2{driver2};
+
+// ── Error-rate tracking (rolling 16-poll window, bitmask) ──────────────────
 static uint16_t errMask1 = 0;
 static uint16_t errMask2 = 0;
 
-// Popcount for uint16 — compiler will inline/optimize to single instruction
-// on most targets; we only call this from handleData() (HTTP path), never
-// from the tight poll loop.
 static inline uint8_t popcount16(uint16_t v) {
   v = v - ((v >> 1) & 0x5555u);
   v = (v & 0x3333u) + ((v >> 2) & 0x3333u);
@@ -63,14 +74,12 @@ static inline uint8_t popcount16(uint16_t v) {
 WebServer   server(80);
 DNSServer   dns;
 Preferences prefs;
-MFRC522     rfid1(RFID1_SS, RFID1_RST);
-MFRC522     rfid2(RFID2_SS, RFID2_RST);
 
-bool     apMode      = false;
-String   lastUID1    = "None";
-String   lastUID2    = "None";
-uint32_t lastRead1   = 0;   // millis() of last successful read, 0 = never
-uint32_t lastRead2   = 0;
+bool     apMode    = false;
+String   lastUID1  = "None";
+String   lastUID2  = "None";
+uint32_t lastRead1 = 0;   // millis() of last successful read, 0 = never
+uint32_t lastRead2 = 0;
 
 // ── JSON helper ────────────────────────────────────────────────────────────
 void sendJSON(int code, const String &json) {
@@ -88,7 +97,6 @@ bool connectWifi(const String &ssid, const String &psk) {
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.setHostname(HOSTNAME);
 
-  // RF calibration kick
   WiFi.begin(ssid.c_str(), psk.c_str());
   delay(500);
   WiFi.disconnect(true);
@@ -136,16 +144,13 @@ void handleRoot() {
 }
 
 void handleData() {
-  // Antenna gain register value: 0x00–0x70 (3 bits × 16 = 7 steps).
-  // Read once here (HTTP path), never in the poll loop.
-  uint8_t gain1 = (rfid1.PCD_ReadRegister(MFRC522::RFCfgReg) >> 4) & 0x07;
-  uint8_t gain2 = (rfid2.PCD_ReadRegister(MFRC522::RFCfgReg) >> 4) & 0x07;
+  // Antenna gain: read RFCfgReg via MFRC522v2 driver (HTTP path only)
+  uint8_t gain1 = (driver1.readRegister(MFRC522::PCD_Register::RFCfgReg) >> 4) & 0x07;
+  uint8_t gain2 = (driver2.readRegister(MFRC522::PCD_Register::RFCfgReg) >> 4) & 0x07;
 
-  // Hits out of 16 polls → 0-16
   uint8_t hits1 = popcount16(errMask1);
   uint8_t hits2 = popcount16(errMask2);
 
-  // ms since last read (0 if never seen)
   uint32_t age1 = lastRead1 ? (millis() - lastRead1) : 0xFFFFFFFFu;
   uint32_t age2 = lastRead2 ? (millis() - lastRead2) : 0xFFFFFFFFu;
 
@@ -203,29 +208,16 @@ void setupServer() {
 // ── RFID helpers ───────────────────────────────────────────────────────────
 //
 // Strategy for maximum poll rate / zero missed tags:
-//
-//  1. Use REQA (RequestA) instead of WakeupA so we detect cards that are
-//     already in IDLE state (fresh cards entering the field). WakeupA is
-//     needed to wake HALT-ed cards but we always HALT after a successful
-//     read, so on the very next poll we must use WakeupA. We alternate:
-//     RequestA first; if that fails, try WakeupA. This covers both cases.
-//
-//  2. After every successful read — and after every failed attempt — we
-//     explicitly HALT the PICC and stop crypto. Without this the RC522
-//     stays in ACTIVE state talking to the last card, blocking detection
-//     of any new card on subsequent polls.
-//
-//  3. SPI clock is set to 10 MHz (RFID_SPI_HZ) so frame transfers are as
-//     short as possible.
-//
-//  4. No delay() anywhere in the poll path.
-//
-// Returns the colon-separated uppercase UID string, or "" if no card found.
-// errMask is shifted and updated here — single OR, no branches added.
+//  1. REQA first (IDLE cards), then WUPA (HALT-ed cards) — covers both states.
+//  2. Always rfidIdle() after every attempt — keeps the reader ready for the
+//     next poll instead of staying stuck in ACTIVE state.
+//  3. 10 MHz SPI clock — shortest possible frame time.
+//  4. No delay() in the poll path.
+//  5. errMask shifted every poll: two ops, no branches, no overhead.
 
 static inline void rfidIdle(MFRC522 &rfid) {
-  rfid.PICC_HaltA();      // send HALT command — PICC enters HALT state
-  rfid.PCD_StopCrypto1(); // clear MFCrypto1On bit — ready for next poll
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
 }
 
 String pollReader(MFRC522 &rfid, const char *label,
@@ -233,13 +225,10 @@ String pollReader(MFRC522 &rfid, const char *label,
   byte atqaBuf[2];
   byte atqaLen = sizeof(atqaBuf);
 
-  // Try REQA first (detects cards in IDLE), then WUPA (detects HALT-ed cards).
   bool detected =
-    (rfid.PICC_RequestA(atqaBuf, &atqaLen) == MFRC522::STATUS_OK) ||
-    (rfid.PICC_WakeupA (atqaBuf, &atqaLen) == MFRC522::STATUS_OK);
+    (rfid.PICC_RequestA(atqaBuf, &atqaLen) == MFRC522::StatusCode::STATUS_OK) ||
+    (rfid.PICC_WakeupA (atqaBuf, &atqaLen) == MFRC522::StatusCode::STATUS_OK);
 
-  // Rolling 16-poll window: shift left, set LSB on hit.
-  // Two ops, no branch added to the hot path.
   errMask = (errMask << 1) | (detected ? 1u : 0u);
 
   if (!detected) return "";
@@ -249,7 +238,6 @@ String pollReader(MFRC522 &rfid, const char *label,
     return "";
   }
 
-  // Build UID string
   String uid = "";
   for (byte i = 0; i < rfid.uid.size; i++) {
     if (i) uid += ':';
@@ -258,8 +246,7 @@ String pollReader(MFRC522 &rfid, const char *label,
   }
   uid.toUpperCase();
 
-  lastReadTs = millis(); // timestamp of successful read
-
+  lastReadTs = millis();
   rfidIdle(rfid);
 
   DPRINT(label); DPRINT(" UID: "); DPRINTLN(uid);
@@ -294,24 +281,23 @@ void setup() {
 
   setupServer();
 
-  // Explicit 10 MHz SPI clock — do not rely on platform default
-  SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID1_SS);
+  // MFRC522v2 uses SPIClass directly; pass the bus + explicit clock
+  SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI);
   SPI.setFrequency(RFID_SPI_HZ);
 
   rfid1.PCD_Init();
-  rfid1.PCD_SetAntennaGain(rfid1.RxGain_max);
+  rfid1.PCD_SetAntennaGain(MFRC522::RxGain::RxGain_max);
   rfidIdle(rfid1);
   DPRINTLN("RFID1 ready");
 
   rfid2.PCD_Init();
-  rfid2.PCD_SetAntennaGain(rfid2.RxGain_max);
+  rfid2.PCD_SetAntennaGain(MFRC522::RxGain::RxGain_max);
   rfidIdle(rfid2);
   DPRINTLN("RFID2 ready");
 }
 
 // ── Loop ───────────────────────────────────────────────────────────────────
 void loop() {
-  // ── Network services (non-blocking) ──────────────────────────────────────
   if (!apMode) {
     ArduinoOTA.handle();
 
@@ -337,7 +323,7 @@ void loop() {
 
   server.handleClient();
 
-  // ── Reader 1 ──────────────────────────────────────────────────────────────
+  // ── Reader 1 ────────────────────────────────────────────────────────────
   {
     String uid = pollReader(rfid1, "[RFID1]", errMask1, lastRead1);
     if (uid.length() && uid != lastUID1) {
@@ -346,7 +332,7 @@ void loop() {
     }
   }
 
-  // ── Reader 2 ──────────────────────────────────────────────────────────────
+  // ── Reader 2 ────────────────────────────────────────────────────────────
   {
     String uid = pollReader(rfid2, "[RFID2]", errMask2, lastRead2);
     if (uid.length() && uid != lastUID2) {
